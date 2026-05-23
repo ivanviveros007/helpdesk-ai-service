@@ -1,8 +1,8 @@
 # Software Design Document (SDD)
 ## Sistema Inteligente de Mesa de Ayuda con IA
 
-**Versión:** 1.0.0  
-**Fecha:** 2026-05-22  
+**Versión:** 1.2.0  
+**Fecha:** 2026-05-23  
 **Autor:** Arquitectura de Software — AI Helpdesk Team  
 **Estado:** Draft
 
@@ -41,16 +41,18 @@ El sistema automatiza la **clasificación, priorización y asignación dinámica
 
 ### 1.3 Repositorios del Proyecto
 
-| Repositorio | Tecnología | Responsabilidad |
-|-------------|------------|-----------------|
-| `helpdesk-frontend` | Next.js 14, TailwindCSS, TypeScript | Interfaz de usuario, WebSocket client |
-| `helpdesk-backend` | NestJS, TypeORM, PostgreSQL | Orquestación, Auth, Base de datos, WebSocket server |
-| `helpdesk-ai-service` | Python 3.11+, FastAPI, LangChain, ChromaDB | Agente de IA, RAG, Decisión de asignación |
+| Repositorio | Tecnología | Puerto | Responsabilidad |
+|-------------|------------|--------|-----------------|
+| `helpdesk-front` | Next.js 16, TailwindCSS, TypeScript | 3000 | Portal de clientes y técnicos, WebSocket client |
+| `helpdesk-backend` | NestJS, TypeORM, PostgreSQL | 3001 | Orquestación, Auth, Base de datos, WebSocket server |
+| `helpdesk-ai-service` | Python 3.11+, FastAPI, LangChain, ChromaDB | 8000 | Agente de IA, RAG, Decisión de asignación |
+| `helpdesk-superadmin` | Next.js 16, TailwindCSS, TypeScript | 3002 | Dashboard del dueño del SaaS (multi-tenant management) |
 
 ```
 git@github.com:ivanviveros007/helpdesk-front.git
 git@github.com:ivanviveros007/helpdesk-backend.git
 git@github.com:ivanviveros007/helpdesk-ai-service.git
+git@github.com:ivanviveros007/helpdesk-superadmin.git
 ```
 
 ---
@@ -87,6 +89,10 @@ graph TB
         DB_TECHS[(Tecnicos)]
         DB_SKILLS[(Skills)]
         DB_TECH_SKILLS[(Tecnico_Skills)]
+        DB_ORGS[(Organizations)]
+        DB_USERS[(Users)]
+        DB_SUPERADMIN[(SuperAdmins)]
+        DB_INVITATIONS[(Invitations)]
     end
 
     subgraph "helpdesk-ai-service · FastAPI"
@@ -480,10 +486,55 @@ erDiagram
         int skill_id FK
     }
 
+    ORGANIZATIONS {
+        uuid id PK
+        varchar nombre
+        varchar slug UK
+        varchar plan "trial|starter|pro|enterprise"
+        boolean estado_activo
+        timestamp created_at
+    }
+
+    USERS {
+        uuid id PK
+        varchar nombre
+        varchar email UK
+        varchar password_hash
+        varchar role "user"
+        uuid org_id FK
+        boolean estado_activo
+        timestamp created_at
+    }
+
+    SUPER_ADMINS {
+        uuid id PK
+        varchar nombre
+        varchar email UK
+        varchar password_hash
+        timestamp created_at
+    }
+
+    INVITATIONS {
+        uuid id PK
+        uuid token UK
+        varchar email
+        uuid org_id FK
+        varchar role "user"
+        boolean used
+        timestamptz expires_at
+        timestamp created_at
+    }
+
     TICKETS ||--o| TECNICOS : "asignado_a"
+    TICKETS ||--o| USERS : "creado_por"
+    TICKETS ||--o| ORGANIZATIONS : "pertenece_a"
     TECNICOS ||--|| NIVELES : "pertenece_a"
     TECNICOS ||--o{ TECNICO_SKILLS : "tiene"
     SKILLS ||--o{ TECNICO_SKILLS : "incluye"
+    TECNICOS ||--o| ORGANIZATIONS : "pertenece_a"
+    NIVELES ||--o| ORGANIZATIONS : "pertenece_a"
+    USERS ||--o| ORGANIZATIONS : "pertenece_a"
+    INVITATIONS ||--|| ORGANIZATIONS : "pertenece_a"
 ```
 
 ### 4.2 Definición TypeORM — Entidades clave
@@ -537,14 +588,60 @@ export class Technician {
   @Column() nombre: string;
   @Column({ unique: true }) email: string;
   @Column() password_hash: string;
-  @ManyToOne(() => Level)
+  @Column({ type: "enum", enum: TechnicianRole, default: TechnicianRole.TECHNICIAN })
+  role: TechnicianRole;                  // 'technician' | 'admin'
+  @ManyToOne(() => Level, { eager: true, nullable: true })
   @JoinColumn({ name: "nivel_id" })
   nivel: Level;
   @Column({ default: true }) estado_activo: boolean;
   @Column({ default: 0 }) carga_actual: number;
-  @ManyToToMany(() => Skill, { eager: true })
+  @ManyToMany(() => Skill, { eager: true, cascade: true })
   @JoinTable({ name: "tecnico_skills" })
   skills: Skill[];
+  @Column({ nullable: true }) org_id: string;
+  @CreateDateColumn() created_at: Date;
+}
+```
+
+**`user.entity.ts`** (clientes que crean tickets)
+```typescript
+@Entity("users")
+export class User {
+  @PrimaryGeneratedColumn("uuid") id: string;
+  @Column() nombre: string;
+  @Column({ unique: true }) email: string;
+  @Column() password_hash: string;
+  @Column({ default: "user" }) role: string;
+  @Column({ nullable: true }) org_id: string;
+  @Column({ default: true }) estado_activo: boolean;
+  @CreateDateColumn() created_at: Date;
+}
+```
+
+**`organization.entity.ts`**
+```typescript
+@Entity("organizations")
+export class Organization {
+  @PrimaryGeneratedColumn("uuid") id: string;
+  @Column() nombre: string;
+  @Column({ unique: true }) slug: string;
+  @Column({ default: "trial" }) plan: string;
+  @Column({ default: true }) estado_activo: boolean;
+  @CreateDateColumn() created_at: Date;
+}
+```
+
+**`invitation.entity.ts`**
+```typescript
+@Entity("invitations")
+export class Invitation {
+  @PrimaryGeneratedColumn("uuid") id: string;
+  @Column({ unique: true }) token: string;   // UUID generado en el service
+  @Column() email: string;
+  @Column() org_id: string;
+  @Column({ default: "user" }) role: string;
+  @Column({ default: false }) used: boolean;
+  @Column({ type: "timestamptz" }) expires_at: Date;
   @CreateDateColumn() created_at: Date;
 }
 ```
@@ -797,31 +894,42 @@ async def get_routing_context() -> dict:
 
 ### 7.1 Configuración del Gateway NestJS
 
+Cada usuario/técnico se une a su propia room al conectarse. No hay broadcasts globales.
+
+**Rooms:**
+| Room | Se une | Evento que recibe |
+|---|---|---|
+| `tech:{id}` | Técnico (query param: `technicianId`) | `ticket:assigned_to_you` |
+| `user:{id}` | Cliente (query param: `userId`) | `ticket:status_changed` |
+
 **`tickets.gateway.ts`**
 ```typescript
 @WebSocketGateway({
-  cors: { origin: process.env.FRONTEND_URL, credentials: true },
+  cors: { origin: (origin, cb) => cb(null, true), credentials: true },
   namespace: "/tickets",
 })
-export class TicketsGateway implements OnGatewayInit, OnGatewayConnection {
+export class TicketsGateway implements OnGatewayConnection {
   @WebSocketServer() server: Server;
 
   emitTicketUpdated(payload: TicketUpdatedPayload): void {
-    // Emite a todos los conectados al namespace /tickets
-    this.server.emit("ticket:updated", payload);
-    
-    // Emite solo al técnico asignado (room por tecnico_id)
+    // Notifica al técnico asignado
     if (payload.assignedTechnicianId) {
-      this.server.to(`tech:${payload.assignedTechnicianId}`)
-           .emit("ticket:assigned_to_you", payload);
+      this.server
+        .to(`tech:${payload.assignedTechnicianId}`)
+        .emit("ticket:assigned_to_you", payload);
+    }
+    // Notifica al usuario creador
+    if (payload.createdByUserId) {
+      this.server
+        .to(`user:${payload.createdByUserId}`)
+        .emit("ticket:status_changed", payload);
     }
   }
 
   handleConnection(client: Socket): void {
-    const technicianId = client.handshake.query.technicianId as string;
-    if (technicianId) {
-      client.join(`tech:${technicianId}`);
-    }
+    const { technicianId, userId } = client.handshake.query;
+    if (technicianId) client.join(`tech:${technicianId}`);
+    if (userId) client.join(`user:${userId}`);
   }
 }
 ```
@@ -830,28 +938,20 @@ export class TicketsGateway implements OnGatewayInit, OnGatewayConnection {
 
 **`src/hooks/useWebSocket.ts`**
 ```typescript
-import { useEffect, useRef } from "react";
-import { io, Socket } from "socket.io-client";
-import { TicketUpdatedPayload } from "@/types/websocket-events";
-
-export function useTicketUpdates(
-  technicianId: string | undefined,
-  onUpdate: (payload: TicketUpdatedPayload) => void
+// Acepta technicianId (string legacy) o { technicianId?, userId? }
+export function useWebSocket(
+  options: { technicianId?: string; userId?: string } | string | undefined,
+  onEvent: (event: string, payload: TicketUpdatedPayload) => void
 ) {
-  const socketRef = useRef<Socket | null>(null);
-
   useEffect(() => {
-    const socket = io(`${process.env.NEXT_PUBLIC_WS_URL}/tickets`, {
-      query: technicianId ? { technicianId } : {},
-      withCredentials: true,
-    });
+    const opts = typeof options === "string" ? { technicianId: options } : options ?? {};
+    const socket = getSocket(opts);   // singleton por query params
 
-    socket.on("ticket:updated", onUpdate);
-    socket.on("ticket:assigned_to_you", onUpdate);
-    socketRef.current = socket;
+    socket.on("ticket:assigned_to_you", (p) => onEvent("ticket:assigned_to_you", p));
+    socket.on("ticket:status_changed", (p) => onEvent("ticket:status_changed", p));
 
-    return () => { socket.disconnect(); };
-  }, [technicianId]);
+    return () => { socket.off("ticket:assigned_to_you"); socket.off("ticket:status_changed"); };
+  }, []);
 }
 ```
 
@@ -981,7 +1081,7 @@ El `INTERNAL_API_SECRET` es un secreto compartido entre los dos servicios, confi
 
 ```env
 # Database
-DATABASE_URL=postgresql://user:password@localhost:5432/helpdesk_db
+DATABASE_URL=postgresql://bambam@localhost:5432/helpdesk_db
 
 # JWT
 JWT_SECRET=super_secret_key_min_32_chars
@@ -993,8 +1093,9 @@ AI_SERVICE_URL=http://localhost:8000
 # Internal comms
 INTERNAL_API_SECRET=random_shared_secret_256bits
 
-# WebSockets
+# WebSockets / CORS
 FRONTEND_URL=http://localhost:3000
+SUPERADMIN_URL=http://localhost:3002
 
 # App
 PORT=3001
@@ -1023,19 +1124,19 @@ PORT=8000
 LOG_LEVEL=INFO
 ```
 
-### 10.3 `helpdesk-frontend/.env.local`
+### 10.3 `helpdesk-front/.env.local`
 
 ```env
 # Backend API
 NEXT_PUBLIC_API_URL=http://localhost:3001/api
 NEXT_PUBLIC_WS_URL=http://localhost:3001
+NEXT_PUBLIC_APP_URL=http://localhost:3000
+```
 
-# Auth
-NEXTAUTH_SECRET=nextauth_secret_key
-NEXTAUTH_URL=http://localhost:3000
+### 10.4 `helpdesk-superadmin/.env.local`
 
-# Internal (no NEXT_PUBLIC — solo server-side)
-BACKEND_INTERNAL_URL=http://localhost:3001
+```env
+NEXT_PUBLIC_API_URL=http://localhost:3001/api
 ```
 
 ---
@@ -1100,4 +1201,4 @@ export class AiDecisionDto {
 
 ---
 
-*Documento generado el 2026-05-22. Versión 1.0.0 — Revisar ante cambios en la arquitectura de niveles o el LLM utilizado.*
+*Última actualización: 2026-05-23. Versión 1.2.0 — Revisar ante cambios en la arquitectura de niveles, el modelo de datos o el LLM utilizado.*
