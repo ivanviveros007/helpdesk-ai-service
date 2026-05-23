@@ -1,7 +1,7 @@
 # Especificación Funcional — Helpdesk AI
 
 > Documento vivo. Se actualiza a medida que se construye el sistema.
-> Última actualización: 2026-05-23
+> Última actualización: 2026-05-23 (v2 — invitaciones, multi-tenancy completo, super-admin dashboard)
 
 ---
 
@@ -15,18 +15,36 @@ Sistema de mesa de ayuda inteligente donde los tickets de soporte son analizados
 | `helpdesk-backend` | NestJS + TypeORM + PostgreSQL | 3001 |
 | `helpdesk-ai-service` | FastAPI + LangChain + ChromaDB + Gemini | 8000 |
 | `helpdesk-front` | Next.js 16 + TailwindCSS | 3000 |
+| `helpdesk-superadmin` | Next.js 16 + TailwindCSS | 3002 |
 
 ---
 
 ## 2. Roles y permisos
 
-| Rol | Quién es | Qué puede hacer |
-|---|---|---|
-| **user** | Cliente que usa el sistema de soporte | Crear tickets, ver sus propios tickets |
-| **technician** | Técnico de soporte | Ver tickets asignados, cambiar estado, resolver tickets |
-| **admin** | Administrador de la empresa | Todo lo anterior + gestionar técnicos y niveles, ver todos los tickets con filtros |
+| Rol | Entidad DB | Quién es | Quién lo crea |
+|---|---|---|---|
+| **user** | `users` | Cliente que crea tickets | Se auto-registra vía invitación |
+| **technician** | `tecnicos` | Técnico de soporte | Admin de la empresa |
+| **admin** | `tecnicos` (role=admin) | Administrador de la empresa | Super-admin |
+| **superadmin** | `super_admins` | Dueño del SaaS | Seed / manual |
 
-### Acceso por rol (frontend)
+### Qué puede hacer cada rol
+
+| Capacidad | user | technician | admin | superadmin |
+|---|---|---|---|---|
+| Crear tickets | ✅ | — | — | — |
+| Ver sus tickets | ✅ | — | — | — |
+| Ver tickets asignados | — | ✅ | ✅ | — |
+| Resolver tickets | — | ✅ | ✅ | — |
+| Ver todos los tickets (con filtros) | — | — | ✅ | — |
+| Gestionar técnicos | — | — | ✅ | — |
+| Gestionar niveles | — | — | ✅ | — |
+| Invitar clientes | — | — | ✅ | — |
+| Ver/crear organizaciones | — | — | — | ✅ |
+| Ver métricas globales | — | — | — | ✅ |
+| Suspender organizaciones | — | — | — | ✅ |
+
+### Acceso por rol (helpdesk-front — puerto 3000)
 
 | Pantalla | user | technician | admin |
 |---|---|---|---|
@@ -38,40 +56,83 @@ Sistema de mesa de ayuda inteligente donde los tickets de soporte son analizados
 | `/admin/tickets` | — | — | ✅ |
 | `/admin/technicians` | — | — | ✅ |
 | `/admin/levels` | — | — | ✅ |
+| `/admin/users` | — | — | ✅ |
+
+### Acceso (helpdesk-superadmin — puerto 3002)
+
+| Pantalla | superadmin |
+|---|---|
+| `/login` | ✅ |
+| `/dashboard` | ✅ |
+| `/organizations` | ✅ |
+| `/organizations/:id` | ✅ |
+| `/logs` | ✅ |
 
 ---
 
 ## 3. Registro y autenticación
 
-### Registro de usuarios (self-service)
-- Ruta: `POST /auth/register`
-- Cualquier persona puede crear una cuenta con nombre, email y contraseña
-- Al registrarse, se le asigna automáticamente la organización por defecto (`slug: demo`)
-- Tras el registro, se inicia sesión automáticamente y se redirige a `/client/my-tickets`
+### Flujo de invitación (forma recomendada)
+1. Admin de empresa va a `/admin/users` → "Invitar" → ingresa email del cliente
+2. `POST /admin/invitations` genera un token UUID con 7 días de vigencia
+3. El admin comparte el link: `http://localhost:3000/register?invite={token}`
+4. El cliente abre el link → `GET /auth/invite/{token}` valida el token y retorna `{ email, org_nombre, org_id }`
+5. El formulario muestra el nombre de la empresa y pre-completa el email (solo requiere nombre + contraseña)
+6. `POST /auth/register` con `{ nombre, email, password, invite_token }` → asigna `org_id` desde el token y lo marca como usado
+
+### Registro sin invitación (fallback desarrollo)
+- `POST /auth/register` sin `invite_token`
+- Se asigna automáticamente la organización `slug: demo`
+- Solo útil en desarrollo/testing
 
 ### Login
 - Ruta: `POST /auth/login`
-- El backend busca primero en la tabla de técnicos y luego en la de usuarios
+- El backend busca primero en `tecnicos`, luego en `users`, luego en `super_admins`
 - Retorna un JWT con: `{ sub, email, role, entity_type, org_id, nombre }`
 - El frontend redirige según el rol:
   - `user` → `/client/my-tickets`
   - `technician` → `/technician`
   - `admin` → `/admin/tickets`
+  - `superadmin` → `/dashboard` (en helpdesk-superadmin)
 
 ### JWT
 - Duración: 7 días
-- Incluye `entity_type` ('user' | 'technician') para distinguir entre las dos tablas de autenticación
-- Incluye `org_id` para filtrar datos por empresa en todas las queries
+- `entity_type`: `'user'` | `'technician'` | `'superadmin'` — distingue entre las tablas de autenticación
+- `org_id`: filtra datos por empresa en todas las queries; `null` para superadmin
+- `role`: `'user'` | `'technician'` | `'admin'`
+
+### Tokens de invitación
+- Entidad `Invitation`: `{ token (UUID), email, org_id, role, used, expires_at }`
+- Un token solo puede usarse una vez (`used: true` tras el registro)
+- Expiración: 7 días desde la creación
+- `GET /auth/invite/:token` — público, valida y retorna info de la org
 
 ---
 
 ## 4. Multi-tenancy (Organization)
 
-Cada entidad del sistema pertenece a una organización (`org_id`). Esto permite que en el futuro múltiples empresas usen el mismo sistema de forma aislada.
+Cada entidad del sistema pertenece a una organización (`org_id`). Los datos de cada empresa son completamente aislados.
 
-**Estado actual:** una sola organización (`Empresa Demo`, slug: `demo`). Estructura preparada para múltiples tenants.
+**Entidades con `org_id`:** `Ticket`, `Technician`, `Level`, `User`, `Invitation`.
 
-**Entidades con `org_id`:** `Ticket`, `Technician`, `Level`, `User`.
+**Cómo se garantiza el aislamiento:**
+- Todos los endpoints de `/admin/*` filtran por `req.user.org_id` (extraído del JWT)
+- Al crear cualquier entidad desde el admin, se asigna automáticamente el `org_id` del admin logueado
+- Un admin no puede ver ni modificar datos de otra organización
+
+### Ciclo de vida de una organización
+1. **Super-admin** crea la org desde `helpdesk-superadmin` → define nombre, slug, plan y admin inicial
+2. **Admin** crea técnicos, define niveles, invita clientes
+3. **Clientes** se registran vía invitación → crean tickets
+4. **Super-admin** puede suspender (`estado_activo: false`) o reactivar la org
+
+### Credenciales de acceso (development)
+| Rol | Email | Password |
+|---|---|---|
+| superadmin | superadmin@helpdesk.app | SuperAdmin1234! |
+| admin (demo) | admin@demo.com | Admin1234! |
+| técnico (demo) | carlos@demo.com | Tech1234! |
+| usuario (demo) | usuario1@test.com | User1234! |
 
 ---
 
@@ -97,14 +158,19 @@ Los niveles definen la complejidad de los tickets que puede atender cada técnic
 
 ## 6. Gestión de técnicos (Admin)
 
+Los técnicos son creados directamente por el admin de la empresa — no se auto-registran.
+
 **Campos de un técnico:**
 - `nombre`, `email`, `password`
 - `nivel`: nivel de soporte asignado (FK → Level)
 - `skills`: lista de tecnologías/áreas de expertise (ej: `React Native`, `payments`, `Kotlin`)
 - `carga_actual`: cantidad de tickets activos asignados (se incrementa al asignar, decrementa al resolver)
 - `estado_activo`: si puede recibir tickets
+- `org_id`: asignado automáticamente al org_id del admin que lo crea
 
 **Los skills son texto libre.** La IA los compara semánticamente con el contenido del ticket para decidir la asignación.
+
+**UI:** `/admin/technicians` — tabla con CRUD completo, modal de creación/edición con selector de nivel y gestión de skills por tags.
 
 ---
 
@@ -217,8 +283,9 @@ PENDIENTE_IA  ──(IA procesa)──>  ASIGNADO  ──(técnico/admin resuelv
 ### Auth
 | Método | Ruta | Auth | Descripción |
 |---|---|---|---|
-| POST | `/auth/login` | — | Login (técnicos y usuarios) |
+| POST | `/auth/login` | — | Login (técnicos, usuarios, superadmin) |
 | POST | `/auth/register` | — | Registro de usuarios (público) |
+| GET | `/auth/invite/:token` | — | Validar token de invitación |
 
 ### Tickets
 | Método | Ruta | Auth | Descripción |
@@ -234,10 +301,22 @@ PENDIENTE_IA  ──(IA procesa)──>  ASIGNADO  ──(técnico/admin resuelv
 ### Admin
 | Método | Ruta | Auth | Descripción |
 |---|---|---|---|
-| GET/POST | `/admin/technicians` | JWT (admin) | Gestión de técnicos |
+| GET/POST | `/admin/technicians` | JWT (admin) | Gestión de técnicos (filtrado por org) |
 | GET/PATCH/DELETE | `/admin/technicians/:id` | JWT (admin) | Técnico individual |
-| GET/POST | `/admin/levels` | JWT (admin) | Gestión de niveles |
-| GET/POST | `/admin/users` | JWT (admin) | Gestión de usuarios |
+| GET/POST | `/admin/levels` | JWT (admin) | Gestión de niveles (filtrado por org) |
+| GET/PATCH/DELETE | `/admin/levels/:id` | JWT (admin) | Nivel individual |
+| GET/POST | `/admin/invitations` | JWT (admin) | Gestión de invitaciones a clientes |
+
+### Super-Admin
+| Método | Ruta | Auth | Descripción |
+|---|---|---|---|
+| POST | `/super-admin/auth/login` | — | Login super-admin |
+| GET | `/super-admin/organizations` | SuperAdminGuard | Todas las orgs con stats |
+| POST | `/super-admin/organizations` | SuperAdminGuard | Crear org + admin inicial |
+| GET/PATCH | `/super-admin/organizations/:id` | SuperAdminGuard | Detalle / actualizar org |
+| POST | `/super-admin/organizations/:id/admin` | SuperAdminGuard | Crear admin para una org |
+| GET | `/super-admin/metrics` | SuperAdminGuard | KPIs globales del sistema |
+| GET | `/super-admin/logs` | SuperAdminGuard | Actividad reciente + errores IA |
 
 ### Internal (backend → AI service)
 | Método | Ruta | Auth | Descripción |
@@ -246,11 +325,30 @@ PENDIENTE_IA  ──(IA procesa)──>  ASIGNADO  ──(técnico/admin resuelv
 
 ---
 
-## 11. Pendiente / Próximas funcionalidades
+## 11. Super-Admin Dashboard (helpdesk-superadmin)
+
+Aplicación separada en puerto 3002 para el dueño del SaaS.
+
+### Pantallas
+| Ruta | Descripción |
+|---|---|
+| `/login` | Login con credenciales de superadmin |
+| `/dashboard` | KPIs globales: total orgs, tickets hoy/mes, tiempo promedio resolución |
+| `/organizations` | Tabla de todas las orgs con stats + formulario para crear nueva org |
+| `/organizations/:id` | Métricas detalladas, suspender/activar, crear admin adicional |
+| `/logs` | Feed de actividad reciente + alerta de tickets atascados en PENDIENTE_IA |
+
+### Autenticación separada
+- Token guardado en `localStorage` con key `sa_token` (separado del `access_token` de helpdesk-front)
+- `SuperAdminGuard` verifica `entity_type === 'superadmin'` en el JWT
+
+---
+
+## 12. Pendiente / Próximas funcionalidades
 
 - [ ] Notificaciones por email (Resend) al asignar y resolver tickets
 - [ ] Notificaciones por WhatsApp (Twilio) — segunda etapa
-- [ ] Self-service onboarding de nuevas organizaciones
-- [ ] Billing con Stripe
-- [ ] Dashboard de métricas para admin (tickets por técnico, tiempo de resolución, etc.)
-- [ ] Portal de administración SaaS (gestión de todos los tenants)
+- [ ] Billing con Stripe (por plan: trial / starter / pro / enterprise)
+- [ ] Dashboard de métricas para admin (tickets por técnico, tiempo de resolución)
+- [ ] Re-envío de invitaciones expiradas
+- [ ] Gestión de usuarios desde el panel admin (ver lista de clientes registrados)
