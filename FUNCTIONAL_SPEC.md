@@ -1,21 +1,22 @@
 # Especificación Funcional — Helpdesk AI
 
 > Documento vivo. Se actualiza a medida que se construye el sistema.
-> Última actualización: 2026-05-23 (v2 — invitaciones, multi-tenancy completo, super-admin dashboard)
+> Última actualización: 2026-05-24 (v3 — emails, IA por org, landing page)
 
 ---
 
 ## 1. Visión general
 
-Sistema de mesa de ayuda inteligente donde los tickets de soporte son analizados por IA y asignados automáticamente al técnico más adecuado según la naturaleza del problema, la carga de trabajo actual y los skills de cada técnico.
+Sistema SaaS de mesa de ayuda inteligente donde los tickets de soporte son analizados por IA y asignados automáticamente al técnico más adecuado según la naturaleza del problema, la carga de trabajo actual y los skills de cada técnico. Cada organización tiene su propio contexto de IA configurado por el superadmin.
 
 **Repositorios:**
 | Repo | Tech | Puerto |
 |---|---|---|
 | `helpdesk-backend` | NestJS + TypeORM + PostgreSQL | 3001 |
 | `helpdesk-ai-service` | FastAPI + LangChain + ChromaDB + Gemini | 8000 |
-| `helpdesk-front` | Next.js 16 + TailwindCSS | 3000 |
-| `helpdesk-superadmin` | Next.js 16 + TailwindCSS | 3002 |
+| `helpdesk-front` | Next.js 15 + TailwindCSS | 3000 |
+| `helpdesk-superadmin` | Next.js 15 + TailwindCSS | 3002 |
+| `helpdesk-landing` | Next.js 15 + TailwindCSS + Resend | 3003 (dev) |
 
 ---
 
@@ -43,6 +44,7 @@ Sistema de mesa de ayuda inteligente donde los tickets de soporte son analizados
 | Ver/crear organizaciones | — | — | — | ✅ |
 | Ver métricas globales | — | — | — | ✅ |
 | Suspender organizaciones | — | — | — | ✅ |
+| Configurar IA por org | — | — | — | ✅ |
 
 ### Acceso por rol (helpdesk-front — puerto 3000)
 
@@ -115,16 +117,24 @@ Cada entidad del sistema pertenece a una organización (`org_id`). Los datos de 
 
 **Entidades con `org_id`:** `Ticket`, `Technician`, `Level`, `User`, `Invitation`.
 
+**Campos de `Organization`:**
+- `nombre`, `slug` (único), `plan` (trial/starter/pro/enterprise)
+- `estado_activo`: el superadmin puede suspender/reactivar
+- `company_type`: sector de la empresa — configura el comportamiento de la IA
+- `ai_custom_instructions`: instrucciones libres adicionales para el agente IA
+
 **Cómo se garantiza el aislamiento:**
 - Todos los endpoints de `/admin/*` filtran por `req.user.org_id` (extraído del JWT)
 - Al crear cualquier entidad desde el admin, se asigna automáticamente el `org_id` del admin logueado
+- El routing context de IA filtra técnicos y niveles por `org_id` del ticket
 - Un admin no puede ver ni modificar datos de otra organización
 
 ### Ciclo de vida de una organización
-1. **Super-admin** crea la org desde `helpdesk-superadmin` → define nombre, slug, plan y admin inicial
-2. **Admin** crea técnicos, define niveles, invita clientes
-3. **Clientes** se registran vía invitación → crean tickets
-4. **Super-admin** puede suspender (`estado_activo: false`) o reactivar la org
+1. **Super-admin** crea la org desde `helpdesk-superadmin` → define nombre, slug, plan, tipo de empresa y admin inicial
+2. **Super-admin** configura el contexto de IA desde `/organizations/:id`
+3. **Admin** crea técnicos, define niveles, invita clientes
+4. **Clientes** se registran vía invitación → crean tickets
+5. **Super-admin** puede suspender (`estado_activo: false`) o reactivar la org
 
 ### Credenciales de acceso (development)
 | Rol | Email | Password |
@@ -186,7 +196,7 @@ Los técnicos son creados directamente por el admin de la empresa — no se auto
 5. El ticket aparece en la lista del usuario con badge gris "Pendiente IA"
 
 ### 7.2 Análisis por IA (asíncrono, ~5-10 segundos)
-El AI Service recibe el ticket y ejecuta el siguiente pipeline:
+El AI Service recibe `{ ticket_id, asunto, descripcion, org_id }` y ejecuta el siguiente pipeline:
 
 ```
 1. Limpieza del texto
@@ -199,12 +209,14 @@ El AI Service recibe el ticket y ejecuta el siguiente pipeline:
    └── Busca en ChromaDB tickets históricos similares (top 3, umbral coseno 0.75)
    └── Agrega contexto relevante al prompt del agente
 
-4. Contexto de routing
-   └── Llama a GET /api/internal/routing-context (protegido con X-Internal-Secret)
-   └── Obtiene técnicos disponibles con sus skills, nivel y carga actual
+4. Contexto de routing (filtrado por org)
+   └── Llama a GET /api/internal/routing-context?org_id=<id> (X-Internal-Secret)
+   └── Obtiene técnicos y niveles SOLO de esa organización
+   └── Incluye org_context: { company_type, ai_custom_instructions }
 
 5. Agente LangGraph (ReAct)
-   └── Razona sobre el ticket con el contexto RAG + técnicos disponibles
+   └── Razona con contexto RAG + técnicos de la org + perfil de empresa
+   └── Aplica instrucciones custom del cliente si existen
    └── Decide: categoría, prioridad (1-10), nivel sugerido, técnico más adecuado
    └── Retorna JSON estructurado con la decisión
 
@@ -217,8 +229,9 @@ El AI Service recibe el ticket y ejecuta el siguiente pipeline:
 2. Actualiza el ticket: estado → `ASIGNADO`, asigna técnico, guarda categoría/prioridad/razonamiento
 3. Incrementa `carga_actual` del técnico asignado
 4. Emite eventos WebSocket:
-   - `ticket:assigned_to_you` → al room `tech:{technicianId}` (notifica al técnico)
-   - `ticket:status_changed` → al room `user:{userId}` (notifica al usuario creador)
+   - `ticket:assigned_to_you` → al room `tech:{technicianId}`
+   - `ticket:status_changed` → al room `user:{userId}`
+5. **Envía email al técnico asignado** (via Resend) con detalles del ticket y razonamiento de la IA
 
 ### 7.4 Notificación en tiempo real
 - El usuario ve el badge cambiar de gris (`PENDIENTE_IA`) a azul (`ASIGNADO`) sin recargar la página
@@ -230,10 +243,28 @@ El AI Service recibe el ticket y ejecuta el siguiente pipeline:
 - `PATCH /tickets/:id/resolve` → estado → `RESUELTO`
 - Se decrementa `carga_actual` del técnico
 - El usuario ve el badge cambiar a verde (`RESUELTO`) en tiempo real
+- **Envía email al usuario creador** (via Resend) confirmando que su ticket fue resuelto
 
 ---
 
-## 8. WebSocket
+## 8. Notificaciones por Email (Resend)
+
+**Servicio:** `src/email/email.service.ts` en helpdesk-backend  
+**Provider:** Resend (`re_NUvCSS36_...`)  
+**From:** `HelpDesk AI <onboarding@resend.dev>`
+
+| Evento | Destinatario | Asunto |
+|---|---|---|
+| Ticket asignado por IA | Técnico | `🎫 New ticket assigned to you: {asunto}` |
+| Ticket resuelto | Usuario creador | `✅ Your ticket has been resolved: {asunto}` |
+
+**Diseño:** HTML email con tabla de datos, badge de estado, razonamiento de la IA (en email al técnico) y botón CTA.
+
+**Comportamiento:** Fire-and-forget — los fallos de email se loggean pero no bloquean el flujo principal.
+
+---
+
+## 9. WebSocket
 
 **Librería:** Socket.IO  
 **Namespace:** `/tickets`  
@@ -269,7 +300,7 @@ El AI Service recibe el ticket y ejecuta el siguiente pipeline:
 
 ---
 
-## 9. Estados de un ticket
+## 10. Estados de un ticket
 
 ```
 PENDIENTE_IA  ──(IA procesa)──>  ASIGNADO  ──(técnico/admin resuelve)──>  RESUELTO
@@ -278,7 +309,7 @@ PENDIENTE_IA  ──(IA procesa)──>  ASIGNADO  ──(técnico/admin resuelv
 
 ---
 
-## 10. API endpoints principales
+## 11. API endpoints principales
 
 ### Auth
 | Método | Ruta | Auth | Descripción |
@@ -313,7 +344,9 @@ PENDIENTE_IA  ──(IA procesa)──>  ASIGNADO  ──(técnico/admin resuelv
 | POST | `/super-admin/auth/login` | — | Login super-admin |
 | GET | `/super-admin/organizations` | SuperAdminGuard | Todas las orgs con stats |
 | POST | `/super-admin/organizations` | SuperAdminGuard | Crear org + admin inicial |
-| GET/PATCH | `/super-admin/organizations/:id` | SuperAdminGuard | Detalle / actualizar org |
+| GET | `/super-admin/organizations/:id` | SuperAdminGuard | Detalle de org |
+| PATCH | `/super-admin/organizations/:id` | SuperAdminGuard | Actualizar org (nombre, plan, estado) |
+| PATCH | `/super-admin/organizations/:id/ai-config` | SuperAdminGuard | Actualizar configuración de IA |
 | POST | `/super-admin/organizations/:id/admin` | SuperAdminGuard | Crear admin para una org |
 | GET | `/super-admin/metrics` | SuperAdminGuard | KPIs globales del sistema |
 | GET | `/super-admin/logs` | SuperAdminGuard | Actividad reciente + errores IA |
@@ -321,11 +354,51 @@ PENDIENTE_IA  ──(IA procesa)──>  ASIGNADO  ──(técnico/admin resuelv
 ### Internal (backend → AI service)
 | Método | Ruta | Auth | Descripción |
 |---|---|---|---|
-| GET | `/api/internal/routing-context` | X-Internal-Secret header | Contexto para routing de IA |
+| GET | `/api/internal/routing-context?org_id=` | X-Internal-Secret header | Contexto de routing filtrado por org |
 
 ---
 
-## 11. Super-Admin Dashboard (helpdesk-superadmin)
+## 12. Configuración de IA por Organización
+
+Cada organización puede tener un perfil de IA configurado por el superadmin desde `/organizations/:id`.
+
+### Campos en `Organization`
+
+| Campo | Tipo | Descripción |
+|---|---|---|
+| `company_type` | string (nullable) | Sector: `tech_saas`, `ecommerce`, `healthcare`, `retail`, `it_services`, `other` |
+| `ai_custom_instructions` | text (nullable) | Instrucciones libres inyectadas al agente con máxima prioridad |
+
+### Contextos por tipo de empresa
+
+| Tipo | Comportamiento de la IA |
+|---|---|
+| `tech_saas` | Prioriza outages de producción, errores de API, downtime. "down"/"error 500" → prioridad 8+ |
+| `ecommerce` | Prioriza fallos de pago, errores en pedidos, checkout. Tickets de pago → prioridad 8+ |
+| `healthcare` | Prioriza acceso a datos de pacientes e integridad del sistema. Downtime → prioridad 9-10 |
+| `retail` | Prioriza fallos de POS, pagos, inventario durante horario comercial |
+| `it_services` | Prioriza infraestructura, red, seguridad. "breach"/"server down" → prioridad 9-10 |
+
+### Flujo técnico
+
+```
+Ticket creado (org_id: "abc")
+  → Backend envía { ticket_id, asunto, descripcion, org_id: "abc" } al AI service
+  → AI service setea ContextVar org_id="abc" antes de invocar el agente
+  → Agente llama get_routing_context_tool()
+  → Tool llama GET /api/internal/routing-context?org_id=abc
+  → Backend retorna {
+      org_context: { company_type: "tech_saas", ai_custom_instructions: "..." },
+      niveles: [...solo org abc],
+      tecnicos: [...solo org abc]
+    }
+  → Agente lee org_context y ajusta su razonamiento
+  → Decisión: técnico correcto de la org correcta, prioridad ajustada al sector
+```
+
+---
+
+## 13. Super-Admin Dashboard (helpdesk-superadmin)
 
 Aplicación separada en puerto 3002 para el dueño del SaaS.
 
@@ -334,8 +407,8 @@ Aplicación separada en puerto 3002 para el dueño del SaaS.
 |---|---|
 | `/login` | Login con credenciales de superadmin |
 | `/dashboard` | KPIs globales: total orgs, tickets hoy/mes, tiempo promedio resolución |
-| `/organizations` | Tabla de todas las orgs con stats + formulario para crear nueva org |
-| `/organizations/:id` | Métricas detalladas, suspender/activar, crear admin adicional |
+| `/organizations` | Tabla de todas las orgs con stats + formulario para crear nueva org (incluye company_type) |
+| `/organizations/:id` | Métricas detalladas, suspender/activar, crear admin adicional, **configuración de IA** |
 | `/logs` | Feed de actividad reciente + alerta de tickets atascados en PENDIENTE_IA |
 
 ### Autenticación separada
@@ -344,31 +417,35 @@ Aplicación separada en puerto 3002 para el dueño del SaaS.
 
 ---
 
-## 12. Configuración de IA por Organización
+## 14. Landing Page (helpdesk-landing)
 
-Cada organización puede tener un perfil de IA configurado por el superadmin.
+Aplicación de marketing para captación de early adopters. Desplegada en Vercel.
 
-**Campos en `Organization`:**
-- `company_type`: `'tech_saas'` | `'ecommerce'` | `'healthcare'` | `'retail'` | `'it_services'` | `'other'`
-- `ai_custom_instructions`: texto libre con instrucciones adicionales para el agente
+### Secciones
+Hero → Problem → How It Works → Features → For Who → Beta Form → Footer
 
-**Cómo llega al agente:**
-1. Al crear un ticket, el backend envía `org_id` al AI service
-2. El AI service inyecta `org_id` en un ContextVar antes de invocar el agente
-3. La herramienta `get_routing_context` lee el ContextVar y llama al backend con `?org_id=`
-4. El backend retorna `org_context: { company_type, ai_custom_instructions }` + niveles y técnicos filtrados por org
-5. El agente lee `org_context` del resultado de la herramienta y ajusta su razonamiento
+### Formulario de Beta
+- Campos: nombre, email de trabajo, empresa (opcional), mensaje (opcional)
+- Submit → `POST /api/contact` (Next.js API route)
+- Email enviado via Resend a destinatario configurado en `TO_EMAIL` (server-side, nunca expuesto al cliente)
+- Rate limiting: máx. 3 envíos por IP por minuto
 
-**Configuración desde superadmin:** `/organizations/:id` → sección "Configuración de IA"
+### i18n
+- Inglés por default, toggle a español (client-side ContextVar, sin URL routing)
 
-**Endpoint:** `PATCH /super-admin/organizations/:id/ai-config`
+### Variables de entorno (Vercel)
+```
+RESEND_API_KEY=...
+TO_EMAIL=ivan.d.viveros@gmail.com
+```
 
 ---
 
-## 13. Pendiente / Próximas funcionalidades
+## 15. Pendiente / Próximas funcionalidades
 
 - [x] Notificaciones por email (Resend) al asignar y resolver tickets
 - [x] Contexto de IA por organización (company_type + instrucciones custom)
+- [x] Landing page de early adopters con formulario de contacto
 - [ ] Notificaciones por WhatsApp (Twilio) — segunda etapa
 - [ ] Billing con Stripe (por plan: trial / starter / pro / enterprise)
 - [ ] Dashboard de métricas para admin (tickets por técnico, tiempo de resolución)
