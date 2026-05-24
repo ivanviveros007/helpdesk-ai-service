@@ -58,6 +58,7 @@ async def analyze_ticket(payload: TicketInput) -> AiDecision:
             descripcion=descripcion,
             rag_context=rag_context,
             similar_tickets=similar_tickets,
+            org_id=payload.org_id,
         )
     except Exception as e:
         logger.error("Agent failed for ticket %s: %s", payload.ticket_id, e, exc_info=True)

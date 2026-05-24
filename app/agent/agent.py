@@ -1,10 +1,11 @@
 import json
 import logging
 import re
+from typing import Optional
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.prebuilt import create_react_agent
 from app.core.config import get_settings
-from app.agent.tools import get_routing_context_tool
+from app.agent.tools import get_routing_context_tool, current_org_id
 from app.agent.prompts import SYSTEM_PROMPT, build_user_prompt
 from app.schemas.ai_decision import AiDecision
 
@@ -20,7 +21,7 @@ def get_agent():
         llm = ChatGoogleGenerativeAI(
             model=settings.gemini_model,
             google_api_key=settings.gemini_api_key,
-            temperature=0.1,  # Low temp para outputs deterministas y estructurados
+            temperature=0.1,
         )
         _agent = create_react_agent(
             model=llm,
@@ -33,19 +34,16 @@ def get_agent():
 
 def _extract_json(text: str) -> str:
     """Extrae el primer bloque JSON válido de un texto."""
-    # Try direct parse first
     try:
         json.loads(text)
         return text
     except json.JSONDecodeError:
         pass
 
-    # Try extracting from markdown code block
     match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if match:
         return match.group(1)
 
-    # Try finding raw JSON object
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
         return match.group(0)
@@ -59,21 +57,28 @@ async def run_agent(
     descripcion: str,
     rag_context: str,
     similar_tickets: list[dict],
+    org_id: Optional[str] = None,
 ) -> AiDecision:
     """
     Ejecuta el agente ReAct con el ticket y el contexto RAG.
-    Retorna un AiDecision validado con Pydantic.
+    El org_id se inyecta en un ContextVar para que la herramienta de routing
+    filtre técnicos y niveles por organización y devuelva el org_context.
     """
-    agent = get_agent()
-    user_message = build_user_prompt(ticket_id, asunto, descripcion, rag_context)
+    # Set org_id so the routing tool fetches filtered + org-aware context
+    token = current_org_id.set(org_id)
 
-    logger.info("Running agent for ticket %s", ticket_id)
+    try:
+        agent = get_agent()
+        user_message = build_user_prompt(ticket_id, asunto, descripcion, rag_context)
 
-    result = await agent.ainvoke(
-        {"messages": [{"role": "user", "content": user_message}]}
-    )
+        logger.info("Running agent for ticket %s (org: %s)", ticket_id, org_id or "none")
 
-    # Extract the last AI message
+        result = await agent.ainvoke(
+            {"messages": [{"role": "user", "content": user_message}]}
+        )
+    finally:
+        current_org_id.reset(token)
+
     messages = result.get("messages", [])
     last_ai_message = next(
         (m for m in reversed(messages) if hasattr(m, "content") and m.type == "ai"),
@@ -89,7 +94,6 @@ async def run_agent(
     json_str = _extract_json(raw_content)
     decision_data = json.loads(json_str)
 
-    # Merge RAG similar_tickets if agent didn't populate them
     if not decision_data.get("similar_tickets") and similar_tickets:
         decision_data["similar_tickets"] = [
             {
