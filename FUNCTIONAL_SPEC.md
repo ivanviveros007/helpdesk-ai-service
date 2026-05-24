@@ -1,7 +1,7 @@
 # Especificación Funcional — Helpdesk AI
 
 > Documento vivo. Se actualiza a medida que se construye el sistema.
-> Última actualización: 2026-05-24 (v3 — emails, IA por org, landing page)
+> Última actualización: 2026-05-24 (v4 — métricas admin, lista de clientes, reenvío de invitaciones)
 
 ---
 
@@ -41,6 +41,9 @@ Sistema SaaS de mesa de ayuda inteligente donde los tickets de soporte son anali
 | Gestionar técnicos | — | — | ✅ | — |
 | Gestionar niveles | — | — | ✅ | — |
 | Invitar clientes | — | — | ✅ | — |
+| Reenviar invitaciones expiradas | — | — | ✅ | — |
+| Ver clientes registrados | — | — | ✅ | — |
+| Ver métricas de la org | — | — | ✅ | — |
 | Ver/crear organizaciones | — | — | — | ✅ |
 | Ver métricas globales | — | — | — | ✅ |
 | Suspender organizaciones | — | — | — | ✅ |
@@ -56,6 +59,7 @@ Sistema SaaS de mesa de ayuda inteligente donde los tickets de soporte son anali
 | `/client/my-tickets` | ✅ | — | — |
 | `/technician` | — | ✅ | — |
 | `/admin/tickets` | — | — | ✅ |
+| `/admin/metrics` | — | — | ✅ |
 | `/admin/technicians` | — | — | ✅ |
 | `/admin/levels` | — | — | ✅ |
 | `/admin/users` | — | — | ✅ |
@@ -108,6 +112,7 @@ Sistema SaaS de mesa de ayuda inteligente donde los tickets de soporte son anali
 - Un token solo puede usarse una vez (`used: true` tras el registro)
 - Expiración: 7 días desde la creación
 - `GET /auth/invite/:token` — público, valida y retorna info de la org
+- **Reenvío de invitaciones expiradas**: `POST /admin/invitations/:id/resend` — marca la invitación vieja como `used: true` y crea una nueva con el mismo email y un token fresco (otros 7 días). El admin ve el botón "Reenviar" en las filas con estado "Expirado".
 
 ---
 
@@ -336,7 +341,10 @@ PENDIENTE_IA  ──(IA procesa)──>  ASIGNADO  ──(técnico/admin resuelv
 | GET/PATCH/DELETE | `/admin/technicians/:id` | JWT (admin) | Técnico individual |
 | GET/POST | `/admin/levels` | JWT (admin) | Gestión de niveles (filtrado por org) |
 | GET/PATCH/DELETE | `/admin/levels/:id` | JWT (admin) | Nivel individual |
+| GET | `/admin/users` | JWT (admin) | Lista de clientes registrados (filtrado por org) |
 | GET/POST | `/admin/invitations` | JWT (admin) | Gestión de invitaciones a clientes |
+| POST | `/admin/invitations/:id/resend` | JWT (admin) | Reenviar invitación expirada (nuevo token) |
+| GET | `/tickets/admin/metrics` | JWT (admin) | Métricas de la org: por estado, por técnico, resolución promedio |
 
 ### Super-Admin
 | Método | Ruta | Auth | Descripción |
@@ -398,7 +406,44 @@ Ticket creado (org_id: "abc")
 
 ---
 
-## 13. Super-Admin Dashboard (helpdesk-superadmin)
+## 13. Panel Admin — Usuarios y Métricas
+
+### Gestión de usuarios (`/admin/users`)
+
+La pantalla combina dos funciones:
+
+**Invitaciones**
+- Formulario para invitar clientes por email (`POST /admin/invitations`)
+- Tabla de invitaciones con estado (Pendiente / Usado / Expirado), vencimiento y link copiable
+- Botón "Reenviar" en filas con estado **Expirado** → `POST /admin/invitations/:id/resend`
+
+**Clientes registrados**
+- Tabla de usuarios que completaron el registro (`GET /admin/users`)
+- Muestra: nombre, email, estado (activo/inactivo), fecha de registro
+- Filtrado automático por `org_id` del admin logueado
+
+### Dashboard de métricas (`/admin/metrics`)
+
+Endpoint: `GET /tickets/admin/metrics` — datos en tiempo real, refetch automático cada 60s.
+
+**Cards de resumen**
+| Card | Valor |
+|---|---|
+| Total tickets | Acumulado histórico de la org |
+| Tickets este mes | Tickets creados en el mes en curso |
+| Tickets abiertos | Total − Resueltos |
+| Tiempo promedio resolución | Promedio en horas desde creación hasta resolución |
+
+**Gráfico de estados**
+- Barras horizontales para `PENDIENTE_IA`, `ASIGNADO` y `RESUELTO` con porcentaje
+
+**Tabla de carga por técnico**
+- Nombre, carga actual (tickets activos) y total asignados históricamente
+- Badge semafórico: verde (0-2), amarillo (3-5), rojo (6+)
+
+---
+
+## 14. Super-Admin Dashboard (helpdesk-superadmin)
 
 Aplicación separada en puerto 3002 para el dueño del SaaS.
 
@@ -417,7 +462,7 @@ Aplicación separada en puerto 3002 para el dueño del SaaS.
 
 ---
 
-## 14. Landing Page (helpdesk-landing)
+## 15. Landing Page (helpdesk-landing)
 
 Aplicación de marketing para captación de early adopters. Desplegada en Vercel.
 
@@ -441,13 +486,15 @@ TO_EMAIL=ivan.d.viveros@gmail.com
 
 ---
 
-## 15. Pendiente / Próximas funcionalidades
+## 16. Pendiente / Próximas funcionalidades
 
 - [x] Notificaciones por email (Resend) al asignar y resolver tickets
 - [x] Contexto de IA por organización (company_type + instrucciones custom)
 - [x] Landing page de early adopters con formulario de contacto
+- [x] Dashboard de métricas para admin (tickets por estado, por técnico, tiempo de resolución)
+- [x] Re-envío de invitaciones expiradas
+- [x] Ver lista de clientes registrados desde panel admin
 - [ ] Notificaciones por WhatsApp (Twilio) — segunda etapa
 - [ ] Billing con Stripe (por plan: trial / starter / pro / enterprise)
-- [ ] Dashboard de métricas para admin (tickets por técnico, tiempo de resolución)
-- [ ] Re-envío de invitaciones expiradas
-- [ ] Gestión de usuarios desde el panel admin (ver lista de clientes registrados)
+- [ ] Límites por plan (max técnicos, max tickets/mes)
+- [ ] Portal unificado por cliente (subdominio o personalización de marca)
