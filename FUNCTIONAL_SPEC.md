@@ -344,9 +344,31 @@ Aplicación separada en puerto 3002 para el dueño del SaaS.
 
 ---
 
-## 12. Pendiente / Próximas funcionalidades
+## 12. Configuración de IA por Organización
 
-- [ ] Notificaciones por email (Resend) al asignar y resolver tickets
+Cada organización puede tener un perfil de IA configurado por el superadmin.
+
+**Campos en `Organization`:**
+- `company_type`: `'tech_saas'` | `'ecommerce'` | `'healthcare'` | `'retail'` | `'it_services'` | `'other'`
+- `ai_custom_instructions`: texto libre con instrucciones adicionales para el agente
+
+**Cómo llega al agente:**
+1. Al crear un ticket, el backend envía `org_id` al AI service
+2. El AI service inyecta `org_id` en un ContextVar antes de invocar el agente
+3. La herramienta `get_routing_context` lee el ContextVar y llama al backend con `?org_id=`
+4. El backend retorna `org_context: { company_type, ai_custom_instructions }` + niveles y técnicos filtrados por org
+5. El agente lee `org_context` del resultado de la herramienta y ajusta su razonamiento
+
+**Configuración desde superadmin:** `/organizations/:id` → sección "Configuración de IA"
+
+**Endpoint:** `PATCH /super-admin/organizations/:id/ai-config`
+
+---
+
+## 13. Pendiente / Próximas funcionalidades
+
+- [x] Notificaciones por email (Resend) al asignar y resolver tickets
+- [x] Contexto de IA por organización (company_type + instrucciones custom)
 - [ ] Notificaciones por WhatsApp (Twilio) — segunda etapa
 - [ ] Billing con Stripe (por plan: trial / starter / pro / enterprise)
 - [ ] Dashboard de métricas para admin (tickets por técnico, tiempo de resolución)
