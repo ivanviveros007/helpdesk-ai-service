@@ -10,10 +10,14 @@ class Settings(BaseSettings):
     port: int = 8000
     log_level: str = "INFO"
 
-    # Gemini
+    # Gemini (embeddings only)
     gemini_api_key: str
     gemini_model: str = "gemini-2.0-flash"
     gemini_embedding_model: str = "models/gemini-embedding-001"
+
+    # Groq (LLM agent)
+    groq_api_key: str = ""
+    groq_model: str = "llama-3.3-70b-versatile"
 
     # ChromaDB
     chroma_host: str = "localhost"

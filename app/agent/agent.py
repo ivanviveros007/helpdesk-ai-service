@@ -2,7 +2,7 @@ import json
 import logging
 import re
 from typing import Optional
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
 from langgraph.prebuilt import create_react_agent
 from app.core.config import get_settings
 from app.agent.tools import get_routing_context_tool, current_org_id
@@ -18,9 +18,9 @@ def get_agent():
     global _agent
     if _agent is None:
         settings = get_settings()
-        llm = ChatGoogleGenerativeAI(
-            model=settings.gemini_model,
-            google_api_key=settings.gemini_api_key,
+        llm = ChatGroq(
+            model=settings.groq_model,
+            api_key=settings.groq_api_key,
             temperature=0.1,
         )
         _agent = create_react_agent(
@@ -28,7 +28,7 @@ def get_agent():
             tools=[get_routing_context_tool],
             prompt=SYSTEM_PROMPT,
         )
-        logger.info("LangGraph ReAct agent initialized with model: %s", settings.gemini_model)
+        logger.info("LangGraph ReAct agent initialized with model: %s", settings.groq_model)
     return _agent
 
 

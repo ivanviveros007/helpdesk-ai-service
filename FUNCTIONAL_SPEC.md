@@ -1,7 +1,7 @@
 # Especificación Funcional — Helpdesk AI
 
 > Documento vivo. Se actualiza a medida que se construye el sistema.
-> Última actualización: 2026-05-24 (v4 — métricas admin, lista de clientes, reenvío de invitaciones)
+> Última actualización: 2026-05-25 (v5 — cancel/delete tickets, superadmin editar miembros, embedding model fix, UX fixes)
 
 ---
 
@@ -35,6 +35,8 @@ Sistema SaaS de mesa de ayuda inteligente donde los tickets de soporte son anali
 |---|---|---|---|---|
 | Crear tickets | ✅ | — | — | — |
 | Ver sus tickets | ✅ | — | — | — |
+| Cancelar sus tickets | ✅ | — | — | — |
+| Eliminar sus tickets | ✅ | — | — | — |
 | Ver tickets asignados | — | ✅ | ✅ | — |
 | Resolver tickets | — | ✅ | ✅ | — |
 | Ver todos los tickets (con filtros) | — | — | ✅ | — |
@@ -249,6 +251,25 @@ El AI Service recibe `{ ticket_id, asunto, descripcion, org_id }` y ejecuta el s
 - Se decrementa `carga_actual` del técnico
 - El usuario ve el badge cambiar a verde (`RESUELTO`) en tiempo real
 - **Envía email al usuario creador** (via Resend) confirmando que su ticket fue resuelto
+
+### 7.6 Cancelación (por el usuario)
+- El usuario puede cancelar cualquier ticket suyo que no esté resuelto ni ya cancelado
+- `PATCH /tickets/:id/cancel` (solo role=user, solo dueño del ticket)
+- Estado → `CANCELADO`, se decrementa carga del técnico si estaba asignado
+- El ticket queda en el historial en sección "Cancelados" (no se borra)
+
+### 7.7 Eliminación (por el usuario)
+- El usuario puede eliminar definitivamente cualquier ticket suyo
+- `DELETE /tickets/:id` (solo role=user, solo dueño del ticket)
+- Hard delete en DB, se decrementa carga si estaba en estado ASIGNADO
+
+### Estados posibles de un ticket
+| Estado | Descripción |
+|---|---|
+| `PENDIENTE_IA` | Recién creado, esperando análisis de la IA |
+| `ASIGNADO` | IA procesó y asignó a un técnico |
+| `RESUELTO` | Técnico o admin marcó como resuelto |
+| `CANCELADO` | Usuario canceló el ticket |
 
 ---
 
