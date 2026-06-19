@@ -1,7 +1,9 @@
+import asyncio
 import json
 import logging
 import re
 from typing import Optional
+import httpx
 from langchain_groq import ChatGroq
 from langgraph.prebuilt import create_react_agent
 from app.core.config import get_settings
@@ -112,4 +114,31 @@ async def run_agent(
         decision.suggested_level,
         decision.assigned_tecnico_id,
     )
+
+    # Report token usage fire-and-forget
+    usage = getattr(last_ai_message, "usage_metadata", None) or getattr(last_ai_message, "response_metadata", {}).get("usage", {})
+    input_tokens = usage.get("input_tokens", 0) if isinstance(usage, dict) else getattr(usage, "input_tokens", 0)
+    output_tokens = usage.get("output_tokens", 0) if isinstance(usage, dict) else getattr(usage, "output_tokens", 0)
+    if org_id and (input_tokens or output_tokens):
+        asyncio.ensure_future(_report_usage(org_id, ticket_id, input_tokens, output_tokens))
+
     return decision
+
+
+async def _report_usage(org_id: str, ticket_id: Optional[str], input_tokens: int, output_tokens: int) -> None:
+    settings = get_settings()
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(
+                f"{settings.backend_url}/api/internal/ai-usage",
+                json={
+                    "org_id": org_id,
+                    "ticket_id": ticket_id,
+                    "model": settings.groq_model,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                },
+                headers={"X-Internal-Secret": settings.internal_api_secret},
+            )
+    except Exception as exc:
+        logger.warning("Failed to report AI usage: %s", exc)
